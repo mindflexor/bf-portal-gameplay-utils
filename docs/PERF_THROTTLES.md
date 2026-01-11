@@ -14,9 +14,9 @@ The Domination mode solves this by:
 ## Intervals (same formulas as Domination)
 
 ```ts
-const LIVE_CAPTURE_UPDATE_INTERVAL_TICKS = mod.Max(1, mod.Floor(TICK_RATE / 10)); // ~10 Hz
-const LIVE_UI_SCORE_INTERVAL_TICKS       = mod.Max(1, mod.Floor(TICK_RATE / 3));  // ~3.3 Hz
-const LIVE_SFX_INTERVAL_TICKS            = mod.Max(1, mod.Floor(TICK_RATE / 2));  // ~2 Hz
+const LIVE_CAPTURE_UPDATE_INTERVAL_TICKS = mod.Max(1, mod.Floor(TICK_RATE / 3)); // ~10 Hz
+const LIVE_UI_SCORE_INTERVAL_TICKS       = mod.Max(1, mod.Floor(TICK_RATE / 10));  // ~3.0 Hz
+const LIVE_SFX_INTERVAL_TICKS            = mod.Max(1, mod.Floor(TICK_RATE / 2));  // ~1.5 Hz
 ```
 
 ### What each bucket is for
