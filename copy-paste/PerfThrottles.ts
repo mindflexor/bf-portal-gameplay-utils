@@ -1,79 +1,49 @@
 /*
-  Performance Throttles
+  Performance Throttles (copy/paste block)
   Battlefield 6 Portal (30 Hz)
   Author: mindflexor
 
-  Goal:
-  Provide consistent, mode-friendly tick cadences so creators stop running
-  expensive loops every tick. Designed for single-file Portal scripts.
+  This matches the pattern used in Domination_ver_2.7_perf_hotfix_damage_smoothing_30hz.ts:
+  - Keep critical stuff running every tick if it must (damage queue, etc.)
+  - Throttle expensive "live" updates using phaseTickCount + mod.Modulo(...)
 
-  Usage pattern:
-    const perf = perfMakeCadence(TICK_RATE);
-
-    if (perfEveryTicks(phaseTickCount, perf.captureLogic)) { ... }
-    if (perfEveryTicks(phaseTickCount, perf.uiScores)) { ... }
-    if (perfEveryTicks(phaseTickCount, perf.sfx)) { ... }
+  Expected in your mode:
+    - const TICK_RATE = 30;   // Portal treated as 30 ticks/sec
+    - let phaseTickCount = 0; // incremented once per tick while LIVE
 */
 
-export type PerfCadence = {
-  /** High-frequency gameplay checks that still shouldn't run every tick. (~10 Hz @ 30 Hz) */
-  fast: number;
+// ---- Interval constants (same formulas as the Domination mode) ----
 
-  /** Capture point / objective evaluation and related bookkeeping. (~6 Hz @ 30 Hz) */
-  captureLogic: number;
+// Capture point / objective updates (Domination used "FAST" for point syncing + CP ownership/contested logic)
+const LIVE_CAPTURE_UPDATE_INTERVAL_TICKS = mod.Max(1, mod.Floor(TICK_RATE / 10)); // ~10 Hz @ 30 Hz
 
-  /** Match timer + player score UI refresh cadence. (~3 Hz @ 30 Hz) */
-  uiScores: number;
+// UI / tickets / scoreboard updates (Domination used "SLOW" for SetUITime/ChangeTickets/SetUIScores/UpdateScoreboard)
+const LIVE_UI_SCORE_INTERVAL_TICKS = mod.Max(1, mod.Floor(TICK_RATE / 3)); // ~3.3 Hz @ 30 Hz
 
-  /** Non-critical SFX / announcer / ambience triggers. (~2 Hz @ 30 Hz) */
-  sfx: number;
-};
+// Sound effects / announcer / suspense audio (Domination used this for endgame suspense audio)
+const LIVE_SFX_INTERVAL_TICKS = mod.Max(1, mod.Floor(TICK_RATE / 2)); // ~2 Hz @ 30 Hz
 
-/**
- * Creates common cadence intervals (in ticks) from the server tick rate.
- * Values are clamped to at least 1 tick.
- *
- * Defaults are tuned for BF6 Portal @ 30 Hz:
- *  - fast        : 3 ticks  (~10 Hz)
- *  - captureLogic: 5 ticks  (~6 Hz)
- *  - uiScores    : 10 ticks (~3 Hz)
- *  - sfx         : 15 ticks (~2 Hz)
- */
-export function perfMakeCadence(tickRate: number): PerfCadence {
-  const safe = (n: number) => mod.Max(1, mod.Floor(n));
 
-  return {
-    fast: safe(tickRate / 10),
-    captureLogic: safe(tickRate / 6),
-    uiScores: safe(tickRate / 3),
-    sfx: safe(tickRate / 2),
-  };
-}
-
-/**
- * Returns true when the current tick is an execution tick for the interval.
- */
-export function perfEveryTicks(tickCount: number, intervalTicks: number): boolean {
-  const n = mod.Max(1, mod.Floor(intervalTicks));
-  return mod.Modulo(tickCount, n) === 0;
-}
-
-/**
- * Optional helper: run a fixed number of items per execution tick (round-robin).
- * Useful for distributing heavy work like scanning objectives or vehicles.
- */
-export function perfRoundRobinSlice<T>(items: T[], cursor: number, maxPerExec: number): { slice: T[]; nextCursor: number } {
-  const n = mod.Max(1, mod.Floor(maxPerExec));
-  if (items.length === 0) return { slice: [], nextCursor: 0 };
-
-  const out: T[] = [];
-  let c = cursor;
-
-  for (let i = 0; i < n; i++) {
-    out.push(items[c]);
-    c++;
-    if (c >= items.length) c = 0;
-  }
-
-  return { slice: out, nextCursor: c };
-}
+// ---- Example usage (directly based on Domination) ----
+// Call this from your LIVE tick loop after phaseTickCount += 1:
+//
+//   // Throttle expensive live updates to prevent server lag / Hz drops.
+//   if (mod.Modulo(phaseTickCount, LIVE_CAPTURE_UPDATE_INTERVAL_TICKS) === 0) {
+//     SyncPlayersOnPointsFromEngine();
+//     Object.values(serverCapturePoints).forEach((capturePoint) => {
+//       capturePoint.setOwner(mod.GetCurrentOwnerTeam(capturePoint.capturePoint));
+//       UpdateCapturePointContestedState(capturePoint);
+//     });
+//   }
+//
+//   if (mod.Modulo(phaseTickCount, LIVE_SFX_INTERVAL_TICKS) === 0) {
+//     UpdateEndgameSuspenseAudio(); // or any non-critical SFX/announcer logic
+//   }
+//
+//   if (mod.Modulo(phaseTickCount, LIVE_UI_SCORE_INTERVAL_TICKS) === 0) {
+//     SetUITime();
+//     ChangeTickets();
+//     SetUIScores();
+//     UpdateScoreboard();
+//   }
+//

@@ -1,85 +1,61 @@
 # Performance Throttles (BF6 Portal, 30 Hz)
 
+This documentation follows the exact pattern used in the Domination mode
+(`Domination_ver_2.7_perf_hotfix_damage_smoothing_30hz.ts`).
+
 ## Why this exists
-Battlefield 6 Portal servers run at **30 Hz**. Any logic executed every tick directly impacts server stability.
-Many custom modes accidentally run expensive loops every tick (players, objectives, vehicles, UI), causing Hz drops,
-desync, and unstable gunfights.
+Battlefield 6 Portal servers currently run at **30 Hz**. If a script does expensive work every tick,
+server Hz can drop and gunfights can feel inconsistent.
 
-This utility provides a **simple, explicit pattern** for controlling how often different categories of logic run.
+The Domination mode solves this by:
+- Running only truly time-critical logic every tick
+- Throttling heavier updates using `phaseTickCount` + `mod.Modulo(...)`
 
-## Cadence buckets
-Instead of running everything every tick, divide work into buckets:
-
-- **fast** (~10 Hz): important but not per-tick critical logic
-- **captureLogic** (~6 Hz): capture point/objective evaluation + bookkeeping
-- **uiScores** (~3 Hz): match time counter + player scores UI refresh
-- **sfx** (~2 Hz): non-critical sound effects / announcer / ambience triggers
-
-These defaults are tuned for **30 Hz** but scale from the provided tick rate.
-
-## API
-
-### `perfMakeCadence(tickRate)`
-Creates an object of tick intervals.
-
-Example @ 30 Hz:
-- fast: 3 ticks
-- captureLogic: 5 ticks
-- uiScores: 10 ticks
-- sfx: 15 ticks
-
-### `perfEveryTicks(tickCount, intervalTicks)`
-Returns true when it’s time to run that bucket.
+## Intervals (same formulas as Domination)
 
 ```ts
-const perf = perfMakeCadence(TICK_RATE);
+const LIVE_CAPTURE_UPDATE_INTERVAL_TICKS = mod.Max(1, mod.Floor(TICK_RATE / 10)); // ~10 Hz
+const LIVE_UI_SCORE_INTERVAL_TICKS       = mod.Max(1, mod.Floor(TICK_RATE / 3));  // ~3.3 Hz
+const LIVE_SFX_INTERVAL_TICKS            = mod.Max(1, mod.Floor(TICK_RATE / 2));  // ~2 Hz
+```
 
-if (perfEveryTicks(phaseTickCount, perf.captureLogic)) {
-  // capture point logic
+### What each bucket is for
+
+- **LIVE_CAPTURE_UPDATE_INTERVAL_TICKS (~10 Hz)**  
+  Capture points / objective evaluation, contested state, syncing players on points.
+
+- **LIVE_UI_SCORE_INTERVAL_TICKS (~3.3 Hz)**  
+  Match timer counter, tickets, player scores UI, scoreboard refresh.
+
+- **LIVE_SFX_INTERVAL_TICKS (~2 Hz)**  
+  Non-critical sound effects, announcer triggers, ambience, suspense audio.
+
+## Example usage (from Domination)
+
+```ts
+// Throttle expensive live updates to prevent server lag / Hz drops.
+if (mod.Modulo(phaseTickCount, LIVE_CAPTURE_UPDATE_INTERVAL_TICKS) === 0) {
+  SyncPlayersOnPointsFromEngine();
+
+  Object.values(serverCapturePoints).forEach((capturePoint) => {
+    capturePoint.setOwner(mod.GetCurrentOwnerTeam(capturePoint.capturePoint));
+    UpdateCapturePointContestedState(capturePoint);
+  });
 }
 
-if (perfEveryTicks(phaseTickCount, perf.uiScores)) {
-  // update match timer + scoreboard widgets
+if (mod.Modulo(phaseTickCount, LIVE_SFX_INTERVAL_TICKS) === 0) {
+  UpdateEndgameSuspenseAudio();
 }
 
-if (perfEveryTicks(phaseTickCount, perf.sfx)) {
-  // non-critical audio triggers
+if (mod.Modulo(phaseTickCount, LIVE_UI_SCORE_INTERVAL_TICKS) === 0) {
+  SetUITime();
+  ChangeTickets();
+  SetUIScores();
+  UpdateScoreboard();
 }
 ```
 
-### `perfRoundRobinSlice(items, cursor, maxPerExec)` (optional)
-Spreads heavy work across multiple execution ticks.
-
-Common use:
-- Evaluate 1–2 capture points per execution instead of all points at once
-- Iterate vehicles in batches
-
-```ts
-let cursor = 0;
-
-if (perfEveryTicks(phaseTickCount, perf.captureLogic)) {
-  const { slice, nextCursor } = perfRoundRobinSlice(capturePoints, cursor, 2);
-  cursor = nextCursor;
-
-  for (const cp of slice) {
-    // update cp
-  }
-}
-```
-
-## What to throttle
-Good candidates:
-- Objective evaluation
-- AI behaviors (non-critical)
-- Score aggregation
-- UI refreshes (time/score widgets)
-- Audio triggers
-
-Avoid throttling:
-- Damage processing
-- Death validation
-- Time-critical state transitions
-- Input-adjacent logic (if applicable)
-
-## Philosophy
-These helpers don’t hide performance costs — they make them **visible and intentional**.
+## Notes
+- These throttles are intentionally simple and explicit.
+- They are designed for **single-file Portal scripts** (copy/paste friendly).
+- Keep damage processing / death validation on per-tick or event-based logic.
