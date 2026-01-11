@@ -22,6 +22,10 @@ combat readability at 30 Hz without changing total damage dealt.
 - Predictable performance characteristics
 - Clear gameplay trade-offs
 
+## Documentation
+- `docs/PERF_THROTTLES.md`
+- `docs/DAMAGE_SMOOTHING.md`
+
 ## How to use
 Each tool lives in `copy-paste/` as a self-contained TypeScript block.
 
