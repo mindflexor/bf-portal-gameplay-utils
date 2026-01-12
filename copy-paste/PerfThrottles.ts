@@ -13,7 +13,7 @@
 */
 
 // ---- Interval constants (same formulas as the Domination mode) ----
-
+const TICK_RATE = 30;   // Portal treated as 30 ticks/sec
 // Capture point / objective updates (Domination used "FAST" for point syncing + CP ownership/contested logic)
 const LIVE_CAPTURE_UPDATE_INTERVAL_TICKS = mod.Max(1, mod.Floor(TICK_RATE / 2)); // ~15 Hz @ 30 Hz
 
