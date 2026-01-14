@@ -23,7 +23,18 @@ const LIVE_UI_SCORE_INTERVAL_TICKS = mod.Max(1, mod.Floor(TICK_RATE / 10)); // ~
 // Sound effects / announcer / suspense audio (Domination used this for endgame suspense audio)
 const LIVE_SFX_INTERVAL_TICKS = mod.Max(1, mod.Floor(TICK_RATE / 3)); // ~10 Hz @ 30 Hz
 
+//Example of implementation of Throttles in ongoing global function
 
+let phaseTickCount: number = 0;
+
+
+export function OngoingGlobal(): void {
+  phaseTickCount += 1;
+  if (mod.Modulo(phaseTickCount, LIVE_SFX_INTERVAL_TICKS) === 0) {
+      // UpdateYourGameModeLogic();
+    }
+
+  }
 // ---- Example usage (directly based on Domination) ----
 // Call this from your LIVE tick loop after phaseTickCount += 1:
 //

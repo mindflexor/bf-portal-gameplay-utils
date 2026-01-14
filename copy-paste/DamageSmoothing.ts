@@ -339,3 +339,11 @@ function OnPlayerDamaged(
 
   dmgMarkActive(victimId);
 }
+
+
+export function OngoingGlobal(): void {
+  // Damage smoothing queue processing runs every tick (30 Hz) for consistent feel.
+    dmgSpreadProcessQueueTick();
+    dmgSpreadUpdateHealthCacheTick();
+
+  }
