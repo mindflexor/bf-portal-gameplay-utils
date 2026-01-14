@@ -7,35 +7,33 @@
   At 30 Hz, multiple damage events can resolve in a single frame,
   causing instant 100→0 deaths. This system redistributes damage
   over a short window without changing total damage dealt.
+
+  Key Notes:
+  - serverPlayers is populated via OngoingPlayer (per-player tick callback).
+  - isDeployed is maintained via OnPlayerDeployed / OnPlayerDied.
+  - OnPlayerDamaged must be exported and must match SDK signature.
 */
 
 import * as modlib from "modlib";
 
-/* =================================================================================================
-   CORE MODE STATE
-   These are required because the smoothing logic depends on live server state
-================================================================================================= */
-
-// Battlefield Portal runs game logic in ticks (30 Hz in BF6 Portal)
 const TICK_RATE = 30;
 
-// Game status used by the mode
-// In Domination: 3 === LIVE gameplay
-let gameStatus: number = -1;
+/**
+ * "Live" heuristic:
+ * BF Portal SDK in this typing file doesn’t expose a simple GameStatus getter.
+ * Using elapsed time is a practical way to avoid running during pre-round.
+ */
+function isMatchLive(): boolean {
+  return mod.GetMatchTimeElapsed() > 0;
+}
 
 /* =================================================================================================
    SERVER PLAYER TRACKING
-   Minimal Player object required for damage smoothing
 ================================================================================================= */
 
-class Player {
-  // Actual Portal player object
+class ServerPlayer {
   public player: mod.Player;
-
-  // Stable numeric ID (via modlib.getPlayerId)
   public id: number;
-
-  // Whether this player is currently spawned in the world
   public isDeployed: boolean;
 
   constructor(player: mod.Player, id: number) {
@@ -45,32 +43,48 @@ class Player {
   }
 }
 
-// All active players indexed by playerId
-const serverPlayers = new Map<number, Player>();
+const serverPlayers = new Map<number, ServerPlayer>();
+
+function getOrCreateServerPlayer(p: mod.Player): ServerPlayer {
+  const id = modlib.getPlayerId(p);
+  let sp = serverPlayers.get(id);
+  if (!sp) {
+    sp = new ServerPlayer(p, id);
+    serverPlayers.set(id, sp);
+
+    // Initialize caches for this player to avoid undefined behavior later
+    dmgLastHealth[id] = dmgGetCurrentHealth(p);
+    dmgQueued[id] = 0;
+    dmgQueuedTicksLeft[id] = 0;
+    dmgQueuedGiverObjId[id] = 0;
+    dmgActive[id] = false;
+    dmgIsReapplying[id] = false;
+  } else {
+    // Keep the underlying player reference fresh
+    sp.player = p;
+  }
+  return sp;
+}
 
 /* =================================================================================================
    BASIC PLAYER HELPERS
 ================================================================================================= */
 
-// Returns true if the soldier entity is alive
 function isPlayerAlive(player: mod.Player): boolean {
   return mod.GetSoldierState(player, mod.SoldierStateBool.IsAlive);
 }
 
-// Returns the world position of a player (used for distance-based smoothing)
 function getPlayerPosition(player: mod.Player): mod.Vector {
   return mod.GetSoldierState(player, mod.SoldierStateVector.GetPosition);
 }
 
-// Used to recover the damage giver later for proper kill credit
-function findServerPlayerByObjId(playerObjId: number): Player | undefined {
-  let found: Player | undefined = undefined;
+function findServerPlayerByObjId(playerObjId: number): ServerPlayer | undefined {
+  let found: ServerPlayer | undefined = undefined;
 
   serverPlayers.forEach((sp) => {
     if (!sp) return;
     if (!mod.IsPlayerValid(sp.player)) return;
 
-    // ObjId comparison lets us track the original attacker
     if (mod.GetObjId(sp.player) === playerObjId) {
       found = sp;
     }
@@ -83,68 +97,53 @@ function findServerPlayerByObjId(playerObjId: number): Player | undefined {
    DAMAGE SMOOTHING CONFIGURATION
 ================================================================================================= */
 
-// Distance buckets (meters)
 const DMG_SPREAD_CLOSE_MAX_DIST = 10;
 const DMG_SPREAD_MID_MAX_DIST = 25;
 
-// Base smoothing durations (seconds)
-// Close range = more smoothing (bursty weapons)
-// Long range = less smoothing (snipers feel snappy)
 const DMG_SPREAD_CLOSE_SEC = 2.0; // 0–10 m
-const DMG_SPREAD_MID_SEC   = 1.8; // 10–25 m
-const DMG_SPREAD_FAR_SEC   = 1.6; // 25 m+
+const DMG_SPREAD_MID_SEC = 1.8;   // 10–25 m
+const DMG_SPREAD_FAR_SEC = 1.6;   // 25 m+
 
-// Health-based delay scaling
-// High health = slower spread
-// Low health  = faster spread (prevents “invincible” feeling)
 const DMG_SPREAD_HEALTH_DELAY_MIN_FACTOR = 0.45;
 const DMG_SPREAD_HEALTH_DELAY_MAX_FACTOR = 1.0;
+
+/**
+ * Optional throttle:
+ * Updating *all* deployed players’ health cache every single tick can be wasteful.
+ * This runs the cache update every N ticks instead.
+ */
+const HEALTH_CACHE_UPDATE_EVERY_N_TICKS = 2; // 2 => 15 Hz; set to 1 for full 30 Hz
+let gTickCounter = 0;
 
 /* =================================================================================================
    DAMAGE SMOOTHING STATE
 ================================================================================================= */
 
-// Cached health from previous tick (per player)
 let dmgLastHealth: { [playerId: number]: number } = {};
-
-// Total queued damage waiting to be re-applied
 let dmgQueued: { [playerId: number]: number } = {};
-
-// How many ticks remain to apply the queued damage
 let dmgQueuedTicksLeft: { [playerId: number]: number } = {};
-
-// ObjId of original attacker (used for kill credit)
 let dmgQueuedGiverObjId: { [playerId: number]: number } = {};
 
-// Tracks which players currently need smoothing work
 let dmgActive: { [playerId: number]: boolean } = {};
 let dmgActiveIds: number[] = [];
 
-// Guard flag so our own DealDamage() calls don’t re-trigger smoothing
 let dmgIsReapplying: { [playerId: number]: boolean } = {};
 
 /* =================================================================================================
    DAMAGE SMOOTHING HELPERS
 ================================================================================================= */
 
-// Normalized health (0–1)
 function dmgGetNormalizedHealth(player: mod.Player): number {
   return mod.GetSoldierState(player, mod.SoldierStateNumber.NormalizedHealth);
 }
 
-// Current raw health value
 function dmgGetCurrentHealth(player: mod.Player): number {
   return mod.GetSoldierState(player, mod.SoldierStateNumber.CurrentHealth);
 }
 
-// Applies health-based scaling to the smoothing duration
-function dmgSpreadApplyHealthDelayScale(
-  baseTicks: number,
-  normalizedHealth: number
-): number {
+function dmgSpreadApplyHealthDelayScale(baseTicks: number, normalizedHealth: number): number {
   let h = normalizedHealth;
 
-  // Manual clamp (Portal SDK safe)
   if (typeof h !== "number" || !Number.isFinite(h)) h = 1;
   if (h < 0) h = 0;
   if (h > 1) h = 1;
@@ -157,14 +156,12 @@ function dmgSpreadApplyHealthDelayScale(
   return scaled < 1 ? 1 : scaled;
 }
 
-// Marks a player as actively being smoothed
 function dmgMarkActive(id: number): void {
   if (dmgActive[id]) return;
   dmgActive[id] = true;
   dmgActiveIds.push(id);
 }
 
-// Removes a player from active smoothing
 function dmgUnmarkActive(id: number): void {
   if (!dmgActive[id]) return;
   dmgActive[id] = false;
@@ -173,35 +170,26 @@ function dmgUnmarkActive(id: number): void {
   if (idx >= 0) dmgActiveIds.splice(idx, 1);
 }
 
-// Converts seconds → ticks (30 Hz)
 function dmgSpreadSecondsToTicks(sec: number): number {
   const raw = mod.Ceiling(sec * TICK_RATE);
   return raw < 1 ? 1 : raw;
 }
 
-// Distance between victim and attacker
-function dmgSpreadDistanceMeters(
-  victim: mod.Player,
-  attacker: mod.Player
-): number {
+function dmgSpreadDistanceMeters(victim: mod.Player, attacker: mod.Player): number {
   if (!mod.IsPlayerValid(attacker)) return 99999;
   if (!isPlayerAlive(victim)) return 99999;
   if (!isPlayerAlive(attacker)) return 99999;
 
-  return mod.DistanceBetween(
-    getPlayerPosition(victim),
-    getPlayerPosition(attacker)
-  );
+  return mod.DistanceBetween(getPlayerPosition(victim), getPlayerPosition(attacker));
 }
 
-// Chooses smoothing duration based on distance
 function dmgSpreadPickTicks(distanceMeters: number): number {
-  if (distanceMeters <= DMG_SPREAD_CLOSE_MAX_DIST)
+  if (distanceMeters <= DMG_SPREAD_CLOSE_MAX_DIST) {
     return dmgSpreadSecondsToTicks(DMG_SPREAD_CLOSE_SEC);
-
-  if (distanceMeters <= DMG_SPREAD_MID_MAX_DIST)
+  }
+  if (distanceMeters <= DMG_SPREAD_MID_MAX_DIST) {
     return dmgSpreadSecondsToTicks(DMG_SPREAD_MID_SEC);
-
+  }
   return dmgSpreadSecondsToTicks(DMG_SPREAD_FAR_SEC);
 }
 
@@ -209,9 +197,8 @@ function dmgSpreadPickTicks(distanceMeters: number): number {
    LIVE TICK FUNCTIONS
 ================================================================================================= */
 
-// Updates health cache so we can measure deltas correctly
 function dmgSpreadUpdateHealthCacheTick(): void {
-  if (gameStatus !== 3) return;
+  if (!isMatchLive()) return;
 
   serverPlayers.forEach((sp) => {
     if (!sp || !sp.isDeployed) return;
@@ -222,16 +209,14 @@ function dmgSpreadUpdateHealthCacheTick(): void {
   });
 }
 
-// Re-applies queued damage smoothly over time
 function dmgSpreadProcessQueueTick(): void {
-  if (gameStatus !== 3) return;
+  if (!isMatchLive()) return;
   if (dmgActiveIds.length === 0) return;
 
   for (let i = dmgActiveIds.length - 1; i >= 0; i--) {
     const id = dmgActiveIds[i];
     const sp = serverPlayers.get(id);
 
-    // Player invalid or gone → cancel smoothing
     if (!sp || !sp.isDeployed || !mod.IsPlayerValid(sp.player) || !isPlayerAlive(sp.player)) {
       dmgQueued[id] = 0;
       dmgQueuedTicksLeft[id] = 0;
@@ -241,14 +226,13 @@ function dmgSpreadProcessQueueTick(): void {
     }
 
     const remaining = dmgQueued[id] ?? 0;
-    let ticksLeft = dmgQueuedTicksLeft[id] ?? 0;
+    const ticksLeft = dmgQueuedTicksLeft[id] ?? 0;
 
     if (remaining <= 0 || ticksLeft <= 0) {
       dmgUnmarkActive(id);
       continue;
     }
 
-    // Spread damage evenly across remaining ticks
     let step = mod.Ceiling(remaining / ticksLeft);
     if (step < 1) step = 1;
     if (step > remaining) step = remaining;
@@ -266,31 +250,78 @@ function dmgSpreadProcessQueueTick(): void {
     dmgIsReapplying[id] = false;
 
     dmgQueued[id] -= step;
-    dmgQueuedTicksLeft[id]--;
+    dmgQueuedTicksLeft[id] -= 1;
 
-    if (dmgQueued[id] <= 0) {
+    if (dmgQueued[id] <= 0 || dmgQueuedTicksLeft[id] <= 0) {
       dmgUnmarkActive(id);
     }
   }
 }
 
 /* =================================================================================================
-   DAMAGE EVENT HOOK
+   EVENT HANDLERS (MUST BE EXPORTED + MATCH SDK SIGNATURES)
 ================================================================================================= */
 
-function OnPlayerDamaged(
-  victim: mod.Player,
-  attacker: mod.Player
+/**
+ * Runs once per player per tick. Perfect place to ensure serverPlayers is populated.
+ */
+export function OngoingPlayer(eventPlayer: mod.Player): void {
+  if (!mod.IsPlayerValid(eventPlayer)) return;
+  getOrCreateServerPlayer(eventPlayer);
+}
+
+/**
+ * Called when player deploys (spawns).
+ */
+export function OnPlayerDeployed(eventPlayer: mod.Player): void {
+  if (!mod.IsPlayerValid(eventPlayer)) return;
+  const sp = getOrCreateServerPlayer(eventPlayer);
+  sp.isDeployed = true;
+
+  // Seed health cache immediately on deploy
+  dmgLastHealth[sp.id] = dmgGetCurrentHealth(eventPlayer);
+
+  // Clear any stale queue from prior life
+  dmgQueued[sp.id] = 0;
+  dmgQueuedTicksLeft[sp.id] = 0;
+  dmgQueuedGiverObjId[sp.id] = 0;
+  dmgUnmarkActive(sp.id);
+}
+
+/**
+ * Called when player dies.
+ */
+export function OnPlayerDied(eventPlayer: mod.Player): void {
+  if (!mod.IsPlayerValid(eventPlayer)) return;
+  const sp = getOrCreateServerPlayer(eventPlayer);
+  sp.isDeployed = false;
+
+  // Clear queue so we don't keep processing dead players
+  dmgQueued[sp.id] = 0;
+  dmgQueuedTicksLeft[sp.id] = 0;
+  dmgQueuedGiverObjId[sp.id] = 0;
+  dmgUnmarkActive(sp.id);
+}
+
+/**
+ * IMPORTANT:
+ * This must be exported, and must include (damageType, weaponUnlock) per your SDK typing.
+ */
+export function OnPlayerDamaged(
+  eventPlayer: mod.Player,       // victim
+  eventOtherPlayer: mod.Player,  // attacker
+  _eventDamageType: mod.DamageType,
+  _eventWeaponUnlock: mod.WeaponUnlock
 ): void {
-  if (gameStatus !== 3) return;
-  if (!mod.IsPlayerValid(victim)) return;
-  if (!isPlayerAlive(victim)) return;
+  if (!isMatchLive()) return;
+  if (!mod.IsPlayerValid(eventPlayer)) return;
+  if (!isPlayerAlive(eventPlayer)) return;
 
-  const victimId = modlib.getPlayerId(victim);
-  const sp = serverPlayers.get(victimId);
-  if (!sp || !sp.isDeployed) return;
+  const victimSp = getOrCreateServerPlayer(eventPlayer);
+  if (!victimSp.isDeployed) return;
 
-  const cur = dmgGetCurrentHealth(victim);
+  const victimId = victimSp.id;
+  const cur = dmgGetCurrentHealth(eventPlayer);
 
   // Ignore our own re-applied damage
   if (dmgIsReapplying[victimId]) {
@@ -298,13 +329,13 @@ function OnPlayerDamaged(
     return;
   }
 
-  // Only smooth enemy damage
-  if (!mod.IsPlayerValid(attacker) || mod.Equals(victim, attacker)) {
+  // Only smooth enemy damage (ignore self, invalid, or friendly)
+  if (!mod.IsPlayerValid(eventOtherPlayer) || mod.Equals(eventPlayer, eventOtherPlayer)) {
     dmgLastHealth[victimId] = cur;
     return;
   }
 
-  if (mod.Equals(mod.GetTeam(victim), mod.GetTeam(attacker))) {
+  if (mod.Equals(mod.GetTeam(eventPlayer), mod.GetTeam(eventOtherPlayer))) {
     dmgLastHealth[victimId] = cur;
     return;
   }
@@ -321,29 +352,36 @@ function OnPlayerDamaged(
     return;
   }
 
-  // Undo burst damage
-  mod.Heal(victim, delta);
+  // Undo burst damage immediately
+  mod.Heal(eventPlayer, delta);
+
+  // Keep "previous" as the baseline so multiple hits in the same frame get collected
   dmgLastHealth[victimId] = prev;
 
-  // Queue damage to be reapplied smoothly
-  const dist = dmgSpreadDistanceMeters(victim, attacker);
+  // Queue damage to be re-applied smoothly
+  const dist = dmgSpreadDistanceMeters(eventPlayer, eventOtherPlayer);
   const baseTicks = dmgSpreadPickTicks(dist);
-  const spreadTicks = dmgSpreadApplyHealthDelayScale(
-    baseTicks,
-    dmgGetNormalizedHealth(victim)
-  );
+  const spreadTicks = dmgSpreadApplyHealthDelayScale(baseTicks, dmgGetNormalizedHealth(eventPlayer));
 
   dmgQueued[victimId] = (dmgQueued[victimId] ?? 0) + delta;
   dmgQueuedTicksLeft[victimId] = spreadTicks;
-  dmgQueuedGiverObjId[victimId] = mod.GetObjId(attacker);
+  dmgQueuedGiverObjId[victimId] = mod.GetObjId(eventOtherPlayer);
 
   dmgMarkActive(victimId);
 }
 
+/* =================================================================================================
+   GLOBAL TICK
+================================================================================================= */
 
 export function OngoingGlobal(): void {
-  // Damage smoothing queue processing runs every tick (30 Hz) for consistent feel.
-    dmgSpreadProcessQueueTick();
-    dmgSpreadUpdateHealthCacheTick();
+  gTickCounter++;
 
+  // Cheap per-tick: only touches victims currently being smoothed
+  dmgSpreadProcessQueueTick();
+
+  // Throttled scan: updates health cache every N ticks
+  if (HEALTH_CACHE_UPDATE_EVERY_N_TICKS <= 1 || (gTickCounter % HEALTH_CACHE_UPDATE_EVERY_N_TICKS) === 0) {
+    dmgSpreadUpdateHealthCacheTick();
   }
+}
